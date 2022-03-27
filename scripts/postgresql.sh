@@ -3,6 +3,11 @@
 set -e
 set -x
 
+if [ -z "$DATABASE_URL" ]; then
+	printf 'Error: DATABASE_URL is not set\n' >&2
+	exit 1
+fi
+
 if ! command -v psql >/dev/null; then
 	printf 'Error: psql not found\n' >&2
 	exit 1
@@ -34,9 +39,7 @@ if [ -z "$SKIP_PODMAN" ]; then
 	podman container start newsletter-postgresql
 fi
 
-export DATABASE_URL='postgres://postgres@localhost:5432/newsletter'
-
-until psql -U postgres -h localhost -c '\q' 2>/dev/null; do
+until psql "$DATABASE_URL" -c '\q' 2>/dev/null; do
 	sleep 0.5
 done
 

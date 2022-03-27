@@ -1,10 +1,17 @@
-use sqlx::{PgConnection, Connection};
+use sqlx::{Connection, Executor, PgConnection, PgPool};
 use std::net::TcpListener;
-use zero2prod::config::get_config;
+use uuid::Uuid;
+use zero2prod::config::{DatabaseSettings, get_config};
+use zero2prod::startup::run;
+
+pub struct TestApp {
+    pub address: String,
+    pub pool: PgPool,
+}
 
 #[tokio::test]
 async fn health_check_returns_200() {
-    let address = spawn_app();
+    let TestApp { address, .. } = spawn_app().await;
     let client = reqwest::Client::new();
     let response = client
         .get(&format!("{}/health_check", &address))
@@ -17,12 +24,7 @@ async fn health_check_returns_200() {
 
 #[tokio::test]
 async fn subscribe_returns_200_for_valid_form_data() {
-    let address = spawn_app();
-    let config = get_config().expect("Failed to read config");
-    let connection_string = config.database.connection_string();
-    let mut connection = PgConnection::connect(&connection_string)
-        .await
-        .expect("Failed to connect to PostgreSQL");
+    let TestApp { address, pool } = spawn_app().await;
     let client = reqwest::Client::new();
     let body = "name=le%20guin&email=ursula_le_guin%40gmail.com";
     let response = client
@@ -36,7 +38,7 @@ async fn subscribe_returns_200_for_valid_form_data() {
     assert_eq!(200, response.status().as_u16());
 
     let row = sqlx::query!("SELECT email, name FROM subscriptions")
-        .fetch_one(&mut connection)
+        .fetch_one(&pool)
         .await
         .expect("Failed to fetch subscription");
 
@@ -46,7 +48,7 @@ async fn subscribe_returns_200_for_valid_form_data() {
 
 #[tokio::test]
 async fn subscribe_returns_400_when_data_is_missing() {
-    let address = spawn_app();
+    let TestApp { address, .. } = spawn_app().await;
     let client = reqwest::Client::new();
     let test_cases = vec![
         ("name=le%20guin", "missing the email"),
@@ -71,12 +73,38 @@ async fn subscribe_returns_400_when_data_is_missing() {
     }
 }
 
-fn spawn_app() -> String {
+async fn spawn_app() -> TestApp {
     let listener = TcpListener::bind("[::1]:0")
         .expect("Failed to bind to random port");
     let port = listener.local_addr().unwrap().port();
-    let server = zero2prod::startup::run(listener)
+    let address = format!("http://[::1]:{}", port);
+    let mut config = get_config().expect("Failed to read config");
+    config.database.database_name = format!("{}-{}", config.database.database_name, Uuid::new_v4());
+    let pool = configure_database(&config.database).await;
+    let server = run(listener, pool.clone())
         .expect("Failed to bind address");
     let _ = tokio::spawn(server);
-    format!("http://[::1]:{}", port)
+
+    TestApp {
+        address,
+        pool,
+    }
+}
+
+async fn configure_database(config: &DatabaseSettings) -> PgPool {
+    let mut conn = PgConnection::connect(&config.connection_string_without_database())
+        .await
+        .expect("Failed to connect to PostgreSQL");
+    conn
+        .execute(format!(r#"CREATE DATABASE "{}";"#, config.database_name).as_str())
+        .await
+        .expect("Failed to create database");
+    let pool = PgPool::connect(&config.connection_string())
+        .await
+        .expect("Failed to connect to PostgreSQL");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("Failed to migrate database");
+    pool
 }
